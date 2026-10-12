@@ -142,7 +142,6 @@ class LLMAgent:
             state["belief"] = self.belief.summary()
         return json.dumps(state, ensure_ascii=False)
 
-
     # ---------- stage 3: action decision ----------
 
     def decide(self, notice, observation):
