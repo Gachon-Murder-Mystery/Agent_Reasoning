@@ -3,4 +3,4 @@ key.txt
 data/
 __pycache__/
 *.pyc
-Total_PRD.svg
+architecture_overview.svg
