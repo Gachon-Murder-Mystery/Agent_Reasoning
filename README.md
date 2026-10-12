@@ -9,7 +9,7 @@ Implements the LLM player agents that take part in the game. While the engine ow
 
 
 ## Architecture Overview
-![아키텍처 다이어그램](Total_PRD.svg)
+![아키텍처 다이어그램](etc/architecture_overview.svg)
 
 
 ## 실행
