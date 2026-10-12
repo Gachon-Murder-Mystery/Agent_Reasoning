@@ -1,4 +1,4 @@
-# 오네이트 익스프레스 · 대화형 TRPG GM (v2)
+# Ornate Express · Conversational TRPG GM (v2)
 # Multi-Agent
 Implements the LLM player agents that take part in the game. While the engine owns the rules and the GM drives the flow, this component is the one that actually reads the situation and decides what to do.
 
