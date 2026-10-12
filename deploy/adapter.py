@@ -1,4 +1,4 @@
-from contracts import ActionRequest
+# from contracts import ActionRequest (temporary)
 
 
 class PlayerAdapter:
