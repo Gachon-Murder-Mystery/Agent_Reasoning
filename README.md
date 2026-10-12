@@ -1,6 +1,17 @@
 # 오네이트 익스프레스 · 대화형 TRPG GM (v2)
+# Multi-Agent
 
 마스터에게 자연어로 행동과 대사를 입력하는 로컬 데모입니다. 기존 버튼 중심 데모를 채팅, 장소 상태, NPC 기억, 판정 요청 흐름으로 리팩토링했습니다.
+
+
+## Code
+- agent.py : 
+- adapter.py : 
+- llm.py : 
+- schema.rs (.py) : 
+
+![아키텍처 다이어그램](Total_PRD.svg)
+
 
 ## 실행
 
