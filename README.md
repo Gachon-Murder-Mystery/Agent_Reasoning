@@ -1,20 +1,18 @@
 # 오네이트 익스프레스 · 대화형 TRPG GM (v2)
 # Multi-Agent
+Implements the LLM player agents that take part in the game. While the engine owns the rules and the GM drives the flow, this component is the one that actually reads the situation and decides what to do.
 
-마스터에게 자연어로 행동과 대사를 입력하는 로컬 데모입니다. 기존 버튼 중심 데모를 채팅, 장소 상태, NPC 기억, 판정 요청 흐름으로 리팩토링했습니다.
+* Chooses oe action per turn - move, explore, question, or accuse - form the givenn state
+* Decides whether to disclose orr withhold clues when questioned by anoter agent
+* Backs its decisions with probabilistic reasoning that narrows down the candidates
+* Records every decision for later verification of the research hypothese
 
 
-## Code
-- agent.py : 
-- adapter.py : 
-- llm.py : 
-- schema.rs (.py) : 
-
+## Architecture Overview
 ![아키텍처 다이어그램](Total_PRD.svg)
 
 
 ## 실행
-
 Python **3.10 이상**이면 별도 패키지 설치가 필요 없습니다. 압축을 풀고 폴더 안에서 실행하세요.
 
 ```bash
