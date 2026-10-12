@@ -4,3 +4,4 @@ data/
 __pycache__/
 *.pyc
 architecture_overview.svg
+.DS_Store
