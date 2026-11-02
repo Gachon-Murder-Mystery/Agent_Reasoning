@@ -1,46 +1,78 @@
-"""LLM reasoning agent. Takes game state and decides one action
+"""LLM reasoning agent for competitive-v1.3. One observation in, one action out.
+
+The engine owns rules, dice and disclosure; this file only chooses. Payload
+shapes follow Game-engine/competitive.py `Rules.action` exactly, since a wrong
+field is rejected as `invalid_input` and wastes the phase.
 
 A belief_mode switch exists for the H2 comparison.
-  True  -> structured belief (probabilities + entropy) goes into the prompt
+  True  -> structured belief (remaining candidates + entropy) goes into the prompt
   False -> only raw clue text goes in; the model judges on its own
 
-The decision record format follows the example in the 1-page proposal.
-An unheld ID in evidence_used is recorded rather than rejected, because
-that is exactly what H2 measures (hallucinated evidence).
+An unheld ID in evidence_used is recorded rather than rejected: that is exactly
+what H2 measures (hallucinated evidence).
 """
 import json
 import re
 import time
-
 from pathlib import Path
+
 from schema import BeliefState
 from llm import GatewayError
 
-SCHEMA_VERSION = "b-0.3"
+SCHEMA_VERSION = "b-0.4"
 LOG_PATH = Path("decisions.jsonl")
+
+CATEGORIES = ("suspect", "weapon", "place")
+SIZES = {"suspect": 12, "weapon": 8, "place": 8}
+APPROACHES = ("question", "interrogate", "threaten", "negotiate")
+STAT_BY_APPROACH = {"explore": "observe", "question": "speech", "negotiate": "speech",
+                    "interrogate": "pressure", "threaten": "pressure"}
+FALLBACK = {"movement": ("stay", {}), "interaction": ("pass", {}), "deduction": ("pass", {})}
+DECIDE_BUDGET = 700
+ANSWER_BUDGET = 450
 
 
 class LLMAgent:
-    def __init__(self, agent_id, client, belief_mode=True, log_path=LOG_PATH):
-        self.agent_id = agent_id 
+    def __init__(self, agent_id, client=None, belief_mode=True, catalog=None, log_path=LOG_PATH):
+        self.agent_id = agent_id
         self.client = client
         self.belief_mode = belief_mode
+        self.catalog = catalog or {}
         self.log_path = Path(log_path)
 
         self.initialized = False
         self.profile = {}
         self.belief = None
-        self.known_info = []        # clues I hold
-        self.applied_seen = []      # held clue ids already folded into belief
-        self.disclosed = []         # clue ids I have disclosed so far
+        self.known_info = []        # clues I hold, as the engine sent them
+        self.applied_seen = []      # clue ids already folded into belief
+        self.disclosed = []         # clue ids I have handed to someone
         self.candidates = {}
-        self.turn = 0 
-        self.inactive = False       # True once turned into NPC/corpse
+        self.relationships = {}
+        self.sub_missions = []
+        self.cycle = 0
+        self.phase = None
+        self.turn = 0
+        self.inactive = False
+        self._tokens = 0            # local tally if the client has no counter
+        self._last_roll = None
+
+    # ---------- token accounting (deduction rank: fewest wins) ----------
+
+    @property
+    def output_tokens(self):
+        totals = getattr(self.client, "usage_totals", None)
+        if callable(totals):
+            return int(totals().get("output") or 0)
+        return self._tokens
+
+    def _count(self, usage):
+        if isinstance(usage, dict):
+            self._tokens += int(usage.get("output") or 0)
 
     # ---------- stage 1: state sync ----------
 
-    def sync(self, notice, observation):
-        me = notice.get("self") or observation.get("self") or {}
+    def sync(self, observation):
+        me = observation.get("self") or {}
 
         if not self.initialized:
             self.profile = dict(me)
@@ -52,15 +84,17 @@ class LLMAgent:
                            "after": me.get("personality")})
             self.profile = dict(me)
 
-        # Candidate pools are fixed, but may arrive empty on the first turn,
-        # so re-check every turn instead of reading them once.
-        cands = observation.get("candidates") or notice.get("candidates")
-        if cands:
-            self.candidates = cands
+        if observation.get("candidates"):
+            self.candidates = observation["candidates"]
         if self.belief_mode and self.belief is None and self.candidates:
-            self.belief = BeliefState(self.candidates)
+            self.belief = BeliefState(self.candidates, agent_id=self.agent_id)
 
-        mode = self.profile.get("mode", "active")
+        self.relationships = observation.get("relationships") or {}
+        self.sub_missions = observation.get("sub_missions") or []
+        self.cycle = observation.get("cycle_id", self.cycle)
+        self.phase = observation.get("phase")
+
+        mode = me.get("mode", "active")
         if mode != "active" and not self.inactive:
             self.inactive = True
             self._log({"event": "mode_changed", "mode": mode})
@@ -72,301 +106,413 @@ class LLMAgent:
             held = {self._item_id(i) for i in self.known_info}
             for item in self.known_info + (observation.get("shared_information") or []):
                 key = self._item_id(item)
-                if key not in self.applied_seen:
-                    self.belief.apply(item, source="own" if key in held else "heard")
-                    self.applied_seen.append(key)
-                    self._log({"event": "clue_seen", "turn": self.turn,
-                               "clue_id": key,
-                               "source": "own" if key in held else "shared"})
+                if key in self.applied_seen:
+                    continue
+                self.belief.apply(item, source="own" if key in held else "heard")
+                self.applied_seen.append(key)
+                self._log({"event": "clue_seen", "cycle": self.cycle, "clue_id": key,
+                           "kind": item.get("kind"),
+                           "source": "own" if key in held else "shared"})
         self.turn += 1
 
     # ---------- stage 2: prompts ----------
 
     def _system_prompt(self):
         return (
-            "너는 살인 미스터리의 수사관이다. JSON 객체 하나만 출력한다.\n\n"
+            "너는 살인 미스터리 경쟁 추리 게임의 플레이어다. JSON 객체 하나만 출력한다.\n\n"
             "출력 형식:\n"
             "{\n"
             '  "evidence_used": [근거로 삼은 단서 ID 배열],\n'
-            '  "current_hypothesis": {"suspect": ID 또는 null, "weapon": ID 또는 null, '
-            '"place": ID 또는 null, "confidence": 0.0~1.0},\n'
+            '  "current_hypothesis": {"suspect": 0~11, "weapon": 0~7, "place": 0~7, '
+            '"confidence": 0.0~1.0},\n'
             '  "action": {"type": 행동, "payload": {...}},\n'
             '  "consideration": "한 문장"\n'
             "}\n\n"
-            "action.type은 반드시 제공된 allowed_actions 중 하나여야 한다.\n"
-            'payload: move={"room": 방 번호}, stay={}, prepare={}, pass={}, '
-            'explore={"approach": "brutality"|"compassion"}, '
-            'question={"target_id": 인물ID, "approach": "brutality"|"compassion"}, '
-            'examine_corpse={"target_id": 시체ID, "approach": "brutality"|"compassion"}, '
-            'accuse={"suspect": 번호, "weapon": 번호, "place": 번호}.\n'
-            "방 번호와 accuse의 세 값은 문자열이 아니라 정수다.\n"
-            "question은 같은 방의 살아있는 인물에게만, "
-            "examine_corpse는 같은 방의 시체에게만 쓸 수 있다. "
-            "occupants의 mode로 구분하라.\n\n"
-            "판정 규칙: 심문과 위험 행동은 1d6을 굴린다. "
-            "prepare를 미리 해두면 주사위를 하나 더 굴린다. "
-            "brutality는 주사위가 내 수치보다 낮아야, compassion은 높아야 성공이다. "
-            "성공하면 사건과 무관한 항목을 하나 배제하는 단서를 얻는다.\n\n"
-            "우선순위:\n"
-            "1) 범인·흉기·장소를 밝히는 것이 최우선이다. "
-            "행동은 증거를 근거로 고르고, 성향은 비슷한 선택지 사이에서만 참고한다.\n"
-            "2) 그 다음이 개인 목표다.\n\n"
-            "evidence_used에는 실제 판단 근거로 쓴 단서 ID만 적는다. "
-            "단서나 인물을 지어내지 마라. "
-            "accuse는 틀리면 즉사한다. 확신이 없으면 pass를 골라라."
+            "action.type은 반드시 allowed_actions 중 하나여야 한다.\n"
+            "payload 형식(필드를 추가하면 거부된다):\n"
+            '  move={"room": 0~7}  stay={}  prepare={}  pass={}\n'
+            '  explore={} 또는 {"target_id": 같은 방 시체의 인물ID}\n'
+            '  question={"target_id": 같은 방 생존 인물ID, "approach": '
+            '"question"|"interrogate"|"threaten"|"negotiate", '
+            '"hypothesis": {"suspect": ID, "weapon": ID, "place": ID}}\n'
+            '  accuse={"suspect": ID, "weapon": ID, "place": ID}\n\n'
+            "판정 규칙:\n"
+            "- 주사위 2개를 굴린다. 직전에 prepare 했으면 3개.\n"
+            "- 각 주사위가 기준선 이상이면 성공 1. 기준선 = 8 − 스탯, 최소 2 최대 6.\n"
+            "- 쓰이는 스탯: explore는 observe, question·negotiate는 speech, "
+            "interrogate·threaten은 pressure.\n"
+            "- explore 획득: 성공 0개→0, 1개→1, 2개→1, 3개→2.\n"
+            "- question 공개량: 0→없음, 1→모호 1, 2→확실 1 또는 모호 2, 3→확실 1 + 모호 2.\n"
+            "- 상대와의 관계가 70 이상이면 question·negotiate 기준선 −1, 30 이하면 +1.\n\n"
+            "접근 선택의 대가:\n"
+            "- question: 성공 시 상대의 나에 대한 관계 +5, 실패 시 −5.\n"
+            "- negotiate: question과 같고 교섭 제안을 겸한다.\n"
+            "- interrogate: 즉시 관계 −5. 실패하면 다음 사이클 끝까지 그 인물에게 질문할 수 없다.\n"
+            "- threaten: 즉시 관계 −10. 실패하면 내 단서 하나가 상대에게 노출된다.\n\n"
+            "질문은 hypothesis에 적은 세 후보에 대해서만 답을 끌어낸다. "
+            "이미 좁혀진 항목보다 아직 넓게 열린 항목을 물어라.\n"
+            "accuse는 맞히면 승리하고 틀리면 즉사한다. 확신이 없으면 단서를 더 모아라.\n"
+            "정답자가 여럿이면 추리에 쓴 출력 토큰이 적은 쪽이 높은 순위다. 장황하게 쓰지 마라.\n"
+            "evidence_used에는 실제로 보유한 단서 ID만 적는다."
         )
 
-
-    def _user_prompt(self, notice, observation):
+    def _user_prompt(self, observation):
+        me = observation.get("self") or {}
+        stats = me.get("stats") or {}
         state = {
-            "turn": self.turn,
-            "phase": observation.get("phase") or notice.get("phase"),
-            "allowed_actions": notice.get("allowed_actions", []),
+            "cycle": observation.get("cycle_id"),
+            "remaining_cycles": observation.get("remaining_cycles"),
+            "phase": observation.get("phase"),
+            "allowed_actions": observation.get("allowed_actions") or [],
             "me": {
-                "job": (self.profile.get("job") or {}).get("name"),
-                "status": self.profile.get("stat"),
-                "personality": (self.profile.get("personality") or {}).get("name"),
-                "personal_goal": (self.profile.get("personal_goal") or {}).get("name"),
-                "room": self.profile.get("room"),
-                "prepared": self.profile.get("prepared"),
+                "character_id": me.get("character_id"),
+                "name": me.get("name"),
+                "job": (me.get("job") or {}).get("name"),
+                "mbti": me.get("mbti"),
+                "room": me.get("room"),
+                "prepared": me.get("prepared"),
+                "stats": stats,
+                "skill": me.get("skill"),
+                "thresholds": {a: min(6, max(2, 8 - (stats.get(s) or 0)))
+                               for a, s in STAT_BY_APPROACH.items()},
             },
-            "occupants": notice.get("occupants", []),
-            "my_information": self.known_info,
+            "occupants": [{"id": x.get("id"), "name": x.get("name"),
+                           "mode": x.get("mode"), "job": x.get("job")}
+                          for x in observation.get("occupants") or []],
+            "positions": [{"id": x.get("id"), "room": x.get("room"), "mode": x.get("mode")}
+                          for x in observation.get("positions") or []],
+            "relationships": self.relationships,
+            "sub_missions": self.sub_missions,
+            "my_information": [self._readable(i) for i in self.known_info],
+            "heard_statements": (observation.get("statements") or [])[-8:],
             "already_disclosed": self.disclosed,
-            "shared_information": notice.get("shared_information", []),
-            "candidates": self.candidates,
+            "announcements": observation.get("announcements") or [],
+            "question_pairs": (observation.get("question_pairs") or [])[-10:],
         }
-        if notice.get("positions") is not None:
-            state["positions"] = notice["positions"]
         if self.belief_mode and self.belief is not None:
             state["belief"] = self.belief.summary()
+        else:
+            state["candidates"] = {k: [c.get("name") for c in (self.candidates.get(k) or [])]
+                                   for k in CATEGORIES}
+        if self._last_roll:
+            state["last_roll"] = self._last_roll
         return json.dumps(state, ensure_ascii=False)
 
-    # ---------- stage 3: action decision ----------
+    # ---------- stage 3: decision ----------
 
-    def decide(self, notice, observation):
-        """Return (action, payload); falls back to pass on failure."""
-        allowed = notice.get("allowed_actions", [])
-        safe = next((a for a in ("pass", "stay") if a in allowed), allowed[0] if allowed else "pass")
+    def decide(self, observation):
+        allowed = observation.get("allowed_actions") or []
+        phase = observation.get("phase") or "interaction"
+        if not allowed:
+            return FALLBACK.get(phase, ("pass", {}))
+        if self.client is None:
+            return self._rule_action(observation, allowed)
 
-        if self.inactive:
-            self._log({"event": "skipped", "turn": self.turn, "reason": "inactive"})
-            return safe, {}
-
-        system, user = self._system_prompt(), self._user_prompt(notice, observation)
-        fail_reason = None
-
-        for attempt in (1, 2):
-            started = time.time()
+        started = time.time()
+        budget, attempt, last = DECIDE_BUDGET, 0, ""
+        while attempt < 2:
+            attempt += 1
             try:
-                raw, usage = self.client.request(system, user, budget=700)
-            except GatewayError as e:
-                # The model was never reached, so there is nothing to re-ask.
-                # Keep the same prompt, wait briefly, and retry.
-                fail_reason = "gateway"
-                self._log({"event": "llm_error", "turn": self.turn,
-                           "context": "action", "attempt": attempt,
-                           "detail": str(e),
-                           "elapsed": round(time.time() - started, 2)})
-                time.sleep(1.5 * attempt)
-                continue
-
-            parsed = self._parse(raw)
+                text, usage = self.client.request(self._system_prompt(),
+                                                  self._user_prompt(observation), budget=budget)
+                self._count(usage)
+            except GatewayError as exc:
+                code = getattr(exc, "code", "http")
+                if code == "truncated" and attempt < 2:
+                    budget = int(budget * 1.6)
+                    continue
+                self._log({"event": "llm_error", "cycle": self.cycle, "phase": phase,
+                           "code": code, "reason": str(exc)[:200]})
+                # Gateway faults are excluded from the H2 denominator.
+                return self._fallback(observation, allowed, "gateway", attempt, started)
+            parsed = self._parse(text)
+            last = text[:300]
             if parsed is None:
-                fail_reason = "invalid_output"
-                user += "\n\n출력이 JSON이 아니었다. JSON 객체 하나만 출력하라."
                 continue
-
-            ok, why = self._validate(parsed, notice)
+            action = (parsed.get("action") or {}).get("type")
+            payload = (parsed.get("action") or {}).get("payload") or {}
+            ok, reason = self._validate(action, payload, observation)
             if not ok:
-                fail_reason = "invalid_output"
-                user += f"\n\n직전 출력이 거부되었다: {why}. 다시 고르라."
+                self._log({"event": "invalid_output", "cycle": self.cycle, "phase": phase,
+                           "action": action, "reason": reason, "attempt": attempt})
                 continue
-
-            action = parsed["action"]["type"]
-            payload = parsed["action"].get("payload") or {}
-            held = self._held_ids()
-
-            # H2 metric: cited IDs outside what I hold or have seen shared.
-            # Recorded, never rejected.
-            grounded = held | self._shared_ids(notice)
-            cited = parsed.get("evidence_used") or []
-            ungrounded = [e for e in cited if e not in grounded]
-
-            self._log({
-                "event": "decision", "turn": self.turn,
-                "phase": observation.get("phase") or notice.get("phase"),
-                "action": action, "payload": payload,
-                "evidence_used": cited, "ungrounded_evidence": ungrounded,
-                "hypothesis": parsed.get("current_hypothesis", {}),
-                "held_count": len(self.known_info),
-                "disclosable_count": len(held - set(self.disclosed)),
-                "attempt": attempt, "fallback": False,
-                "belief_mode": self.belief_mode,
-                "usage": usage, "elapsed": round(time.time() - started, 2),
-            })
-            # Stated reasons may be post-hoc rationalisation, so they are
-            # logged apart from the action data.
-            self._log({"event": "consideration", "turn": self.turn,
-                       "context": "action", "text": parsed.get("consideration", "")})
-
+            payload = self._finalize(action, payload)
+            self._record(parsed, action, payload, observation, attempt, started, usage)
             return action, payload
 
-        # Separating the two causes matters: "gateway" turns are lost to
-        # transport and must be excluded from the H2 denominator, while
-        # "invalid_output" turns are genuine rule-following failures.
-        self._log({"event": "decision", "turn": self.turn,
-                   "phase": observation.get("phase") or notice.get("phase"),
-                   "action": safe, "payload": {},
-                   "fallback": True, "fallback_reason": fail_reason or "unknown",
-                   "belief_mode": self.belief_mode})
-        return safe, {}
+        self._log({"event": "invalid_output", "cycle": self.cycle, "phase": phase,
+                   "reason": "unparseable", "raw": last})
+        return self._fallback(observation, allowed, "invalid_output", attempt, started)
 
-    # ---------- stage 3b: answering a question (B06) ----------
+    def _finalize(self, action, payload):
+        if action == "accuse":
+            # The engine ranks correct deductions by this number, fewest first.
+            payload["output_tokens"] = self.output_tokens
+        return payload
 
-    def respond_to_question(self, asker_id, topic=None):
-        """Decide what to offer, or refuse, when another agent questions me.
+    def _record(self, parsed, action, payload, observation, attempt, started, usage):
+        held = {self._item_id(i) for i in self.known_info}
+        used = [x for x in (parsed.get("evidence_used") or []) if isinstance(x, str)]
+        self._log({"event": "decision", "cycle": self.cycle, "phase": observation.get("phase"),
+                   "action": action, "payload": payload,
+                   "evidence_used": used,
+                   "ungrounded_evidence": [x for x in used if x not in held],
+                   "hypothesis": parsed.get("current_hypothesis"),
+                   "attempt": attempt, "fallback": None,
+                   "belief_mode": self.belief_mode, "usage": usage,
+                   "elapsed": round(time.time() - started, 3)})
+        if parsed.get("consideration"):
+            self._log({"event": "consideration", "cycle": self.cycle,
+                       "context": "action", "text": str(parsed["consideration"])[:500]})
 
-        This is a passive handler and consumes no action. The engine settles
-        what actually transfers with a die roll, so only the intent to
-        disclose is produced here. Returns (offer_ids, refused).
-        """
-        held = self._held_ids()
-        if self.inactive or not held:
-            self._log({"event": "question_response", "turn": self.turn,
-                       "asker": asker_id, "offer": [], "refused": False,
-                       "reason_code": "nothing_to_offer"})
-            return [], False
+    def _fallback(self, observation, allowed, kind, attempt, started):
+        action, payload = self._rule_action(observation, allowed)
+        self._log({"event": "decision", "cycle": self.cycle, "phase": observation.get("phase"),
+                   "action": action, "payload": payload, "evidence_used": [],
+                   "ungrounded_evidence": [], "hypothesis": None,
+                   "attempt": attempt, "fallback": kind,
+                   "belief_mode": self.belief_mode, "usage": None,
+                   "elapsed": round(time.time() - started, 3)})
+        return action, payload
 
-        system = (
-            "너는 살인 미스터리의 수사관이다. 다른 수사관이 너에게 정보를 물었다.\n"
-            "JSON 객체 하나만 출력한다.\n"
-            '{"refuse": true|false, "offer": [공개할 단서 ID 배열], "consideration": "한 문장"}\n\n'
-            "거절하면 상대는 아무것도 얻지 못하지만, 너를 의심하게 될 수 있다.\n"
-            "공개하면 공동 목표에 가까워지지만 네 개인 목표가 불리해질 수 있다.\n"
-            "무엇을 내줄지, 거절할지는 전적으로 네 성향과 개인 목표가 결정한다.\n"
-            "보유하지 않은 단서 ID를 적지 마라."
-        )
-        user = json.dumps({
-            "me": {"personality": (self.profile.get("personality") or {}).get("name"),
-                   "personal_goal": (self.profile.get("personal_goal") or {}).get("name"),
-                   "job": (self.profile.get("job") or {}).get("name")},
-            "asker": asker_id,
-            "topic": topic,
-            "my_information": self.known_info,
-            "already_disclosed": self.disclosed,
-        }, ensure_ascii=False)
+    def _rule_action(self, observation, allowed):
+        """No-LLM policy: never waste a phase, never gamble on accuse."""
+        me = observation.get("self") or {}
+        if "explore" in allowed:
+            corpse = next((x for x in observation.get("occupants") or []
+                           if x.get("mode") == "corpse"), None)
+            return "explore", ({"target_id": corpse["id"]} if corpse else {})
+        if "question" in allowed:
+            living = [x for x in observation.get("occupants") or []
+                      if x.get("mode") != "corpse"]
+            if living:
+                return "question", {"target_id": living[0]["id"], "approach": "question",
+                                    "hypothesis": self._best_guess()}
+            return "prepare", {}
+        if "move" in allowed:
+            return "move", {"room": ((me.get("room") or 0) + 1) % 8}
+        return FALLBACK.get(observation.get("phase") or "interaction", ("pass", {}))
 
-        obj, usage, failed = {}, None, False
-        try:
-            raw, usage = self.client.request(system, user, budget=400)
-            obj = self._parse_obj(raw) or {}
-        except GatewayError as e:
-            self._log({"event": "llm_error", "turn": self.turn,
-                       "context": "question", "detail": str(e)})
-        if not obj:
-            failed = True
+    def _best_guess(self):
+        if self.belief is not None:
+            remaining = self.belief.remaining()
+            return {k: (remaining.get(k) or [0])[0] for k in CATEGORIES}
+        return {k: 0 for k in CATEGORIES}
 
-        refused = bool(obj.get("refuse"))
-        offer = [] if refused else [i for i in (obj.get("offer") or []) if i in held]
-        if failed:
-            # Refuse on call failure. This is a transport artefact, so it is
-            # tagged to keep it out of the H1 withhold-rate numerator.
-            refused, offer = True, []
-        self._log({"event": "question_response", "turn": self.turn,
-                   "asker": asker_id, "topic": topic,
-                   "offer": offer, "refused": refused,
-                   "reason_code": "call_failed" if failed else "model_choice",
-                   "held_count": len(held),
-                   "disclosable_count": len(held - set(self.disclosed)),
-                   "usage": usage})
-        self._log({"event": "consideration", "turn": self.turn,
-                   "context": "question", "text": obj.get("consideration", "")})
-        self.disclosed.extend(i for i in offer if i not in self.disclosed)
-        return offer, refused
-
-    # ---------- parsing and validation ----------
-
-    @staticmethod
-    def _item_id(item):
-        """Clue items may be dicts or bare ID strings depending on the engine."""
-        return item.get("id") if isinstance(item, dict) else item
-
-    @staticmethod
-    def _parse_obj(raw):
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
-        try:
-            obj = json.loads(text)
-        except (ValueError, TypeError):
-            return None
-        return obj if isinstance(obj, dict) else None
-
-    @classmethod
-    def _parse(cls, raw):
-        obj = cls._parse_obj(raw)
-        if obj is None:
-            return None
-        act = obj.get("action")
-        return obj if isinstance(act, dict) and act.get("type") else None
-
-    def _held_ids(self):
-        return {self._item_id(i) for i in self.known_info}
-
-    @classmethod
-    def _shared_ids(cls, notice):
-        return {cls._item_id(i) for i in (notice.get("shared_information") or [])}
-
-    def _pool_ids(self, pool):
-        return {self._item_id(c) for c in (self.candidates.get(pool) or [])}
-
-    def _validate(self, p, notice):
-        action = p["action"]["type"]
-        payload = p["action"].get("payload") or {}
-        if action not in notice.get("allowed_actions", []):
+    def _validate(self, action, payload, observation):
+        allowed = observation.get("allowed_actions") or []
+        if action not in allowed:
             return False, f"{action}은 이번 단계에 허용되지 않는다"
-        fields = {"move": {"room"}, "stay": set(), "pass": set(), "prepare": set(),
-                  "explore": {"approach"}, "question": {"target_id", "approach"},
-                  "examine_corpse": {"target_id", "approach"},
-                  "accuse": {"suspect", "weapon", "place"}}
-        if set(payload) - fields.get(action, set()):
-            return False, "payload에 허용되지 않은 항목이 있다"
-        
-        if action == "move":
-            if payload.get("room") not in self._pool_ids("place"):
-                return False, "존재하지 않는 방"
-        elif action in ("question", "examine_corpse"):
-            here = {self._item_id(o): o.get("mode") for o in notice.get("occupants", [])}
-            here.pop(self.agent_id, None)
-            target = payload.get("target_id")
-            if target not in here:
-                return False, "같은 방에 없는 상대"
-            if (action == "examine_corpse") != (here[target] == "corpse"):
-                return False, "question은 살아있는 인물에게만, examine_corpse는 시체에게만 쓸 수 있다"
-            if payload.get("approach") not in ("brutality", "compassion"):
-                return False, "approach는 brutality 또는 compassion이어야 한다"
-        elif action == "explore":
-            if payload.get("approach") not in ("brutality", "compassion"):
-                return False, "approach는 brutality 또는 compassion이어야 한다"
-        elif action == "accuse":
-            for key in ("suspect", "weapon", "place"):
-                if payload.get(key) not in self._pool_ids(key):
-                    return False, f"{key} 값이 후보에 없다"
+        if not isinstance(payload, dict):
+            return False, "payload는 객체여야 한다"
+        occupants = {x.get("id"): x for x in observation.get("occupants") or []}
 
+        if action == "move":
+            if set(payload) != {"room"} or not self._in_range(payload.get("room"), 8):
+                return False, "move는 room 0~7 하나만 받는다"
+        elif action in ("stay", "pass", "prepare"):
+            if payload:
+                return False, f"{action}에는 payload가 없다"
+        elif action == "explore":
+            if not set(payload) <= {"target_id"}:
+                return False, "explore는 target_id 외의 필드를 받지 않는다"
+            if "target_id" in payload:
+                target = occupants.get(payload["target_id"])
+                if target is None or target.get("mode") != "corpse":
+                    return False, "explore의 target_id는 같은 방의 시체여야 한다"
+        elif action == "question":
+            if not set(payload) <= {"target_id", "approach", "hypothesis"}:
+                return False, "question은 target_id/approach/hypothesis만 받는다"
+            target = occupants.get(payload.get("target_id"))
+            if target is None or target.get("mode") == "corpse":
+                return False, "question 대상은 같은 방의 살아있는 인물이어야 한다"
+            if payload.get("approach") not in APPROACHES:
+                return False, "approach는 question/interrogate/threaten/negotiate 중 하나다"
+            hypothesis = payload.get("hypothesis")
+            if not isinstance(hypothesis, dict) or set(hypothesis) != set(CATEGORIES):
+                return False, "hypothesis는 suspect/weapon/place 세 값이 모두 필요하다"
+            for key in CATEGORIES:
+                if not self._in_range(hypothesis[key], SIZES[key]):
+                    return False, f"hypothesis.{key} 값이 범위를 벗어났다"
+        elif action == "accuse":
+            if not set(payload) <= set(CATEGORIES) | {"confidence", "elapsed_seconds"}:
+                return False, "accuse는 suspect/weapon/place만 지정한다"
+            for key in CATEGORIES:
+                if not self._in_range(payload.get(key), SIZES[key]):
+                    return False, f"{key} 값이 후보 범위를 벗어났다"
+        else:
+            return False, f"알 수 없는 행동 {action}"
         return True, ""
 
-    # ---------- stage 4: result intake ----------
+    # ---------- stage 4: answering another player's question ----------
+
+    def answer_question(self, question):
+        """Pick the form of disclosure. The engine already fixed the amount, and
+        checks it for exact equality, so neither more nor less is accepted."""
+        options = question.get("response_options") or {}
+        successes = question.get("successes", 0)
+        if successes <= 0:
+            return []
+        if self.client is None:
+            return self._required(options, successes)
+
+        prompt = json.dumps({
+            "asker_id": question.get("asker_id"),
+            "approach": question.get("approach"),
+            "asker_hypothesis": question.get("hypothesis"),
+            "successes": successes,
+            "relationship_to_asker": self.relationships.get(str(question.get("asker_character"))),
+            "my_information": [self._readable(i) for i in self.known_info],
+            "already_disclosed": self.disclosed,
+            "response_options": options,
+        }, ensure_ascii=False)
+        system = (
+            "너는 질문을 받은 인물이다. 공개량은 엔진이 성공 수로 이미 정했고, "
+            "너는 무엇을 어떤 형태로 말할지만 고른다. JSON 하나만 출력한다.\n\n"
+            '{"statements": [...], "consideration": "한 문장"}\n\n'
+            "성공 수별 형태(정확히 맞아야 한다. 더 줘도 거부된다): "
+            "1 → 모호 1개. 2 → 확실 1개 또는 모호 2개. 3 → 확실 1개 + 모호 2개.\n"
+            'statements 항목: {"kind":"definite","clue_id":ID} / '
+            '{"kind":"ambiguous","category":...,"candidate":...} / '
+            '{"kind":"indirect","clue_id":ID,"text":...}\n'
+            "indirect의 text는 반드시 그 단서의 narrative_options 중 하나를 그대로 쓴다. "
+            "직접 지어낸 문장은 거부된다.\n"
+            "response_options 밖의 것은 절대 말하지 않는다. 거짓말은 엔진이 차단한다.\n"
+            "성공 2일 때 확실 1개와 모호 2개 중 고를 수 있다. 관계가 나쁜 상대나 "
+            "나와 같은 가설을 쫓는 상대에게는 가치가 낮은 쪽을 내줘라."
+        )
+        try:
+            text, usage = self.client.request(system, prompt, budget=ANSWER_BUDGET)
+            self._count(usage)
+        except GatewayError as exc:
+            self._log({"event": "llm_error", "cycle": self.cycle, "context": "question",
+                       "code": getattr(exc, "code", "http"), "reason": str(exc)[:200]})
+            return self._required(options, successes)
+
+        parsed = self._parse(text)
+        statements = (parsed or {}).get("statements")
+        if not isinstance(statements, list):
+            statements = self._required(options, successes)
+        for s in statements:
+            if isinstance(s, dict) and s.get("clue_id") and s["clue_id"] not in self.disclosed:
+                self.disclosed.append(s["clue_id"])
+        self._log({"event": "question_response", "cycle": self.cycle,
+                   "asker_id": question.get("asker_id"), "approach": question.get("approach"),
+                   "successes": successes, "statements": statements,
+                   "held": len(self.known_info), "usage": usage})
+        if parsed and parsed.get("consideration"):
+            self._log({"event": "consideration", "cycle": self.cycle,
+                       "context": "question", "text": str(parsed["consideration"])[:500]})
+        return statements
+
+    @staticmethod
+    def _required(options, successes):
+        """Mirror of the engine's disclosure tier, used when the model is unavailable."""
+        definite = [{"kind": "definite", "clue_id": c} for c in (options.get("definite") or [])[:1]]
+        vague = [{"kind": "ambiguous", "category": x["category"], "candidate": x["candidate"]}
+                 for x in options.get("ambiguous") or []]
+        vague += [{"kind": "indirect", "clue_id": x["clue_id"], "text": x["narrative_options"][0]}
+                  for x in options.get("indirect") or []]
+        if successes <= 0:
+            return []
+        if successes == 1:
+            return vague[:1] or definite
+        if successes == 2:
+            return definite or vague[:2]
+        return definite + vague[:2]
+
+    # ---------- stage 5: result intake ----------
 
     def ingest_result(self, result):
         gained = []
-        for item in result.get("acquired_information", []):
-            if item not in self.known_info:
+        known = {self._item_id(i) for i in self.known_info}
+        for item in result.get("acquired_information") or []:
+            key = self._item_id(item)
+            if key not in known:
                 self.known_info.append(item)
-                gained.append(self._item_id(item))
-        self._log({"event": "result", "turn": self.turn,
-                   "outcome": result.get("outcome"), "roll": result.get("roll"),
-                   "acquired": gained})
+                known.add(key)
+                gained.append(key)
+            if self.belief_mode and self.belief is not None and key not in self.applied_seen:
+                self.belief.apply(item, source="own")
+                self.applied_seen.append(key)
+        self._last_roll = result.get("roll")
+        self._log({"event": "result", "cycle": self.cycle,
+                   "action": result.get("action"), "outcome": result.get("outcome"),
+                   "roll": result.get("roll"), "acquired": gained,
+                   "held": len(result.get("held_information_ids") or self.known_info)})
 
-    # ---------- logging ----------
+    # ---------- stage 6: negotiation (not an action; no phase cost) ----------
+
+    def propose_trade(self, observation):
+        """Return a trades/propose body, or None to skip this phase."""
+        held = [i for i in self.known_info if i.get("kind") in ("definite", "indirect")]
+        living = [x for x in observation.get("occupants") or [] if x.get("mode") != "corpse"]
+        if not held or not living or self.belief is None:
+            return None
+        remaining = self.belief.remaining()
+        # Ask about whichever category is still widest open; offer the narrowest.
+        want = max(remaining, key=lambda k: len(remaining[k]))
+        if len(remaining[want]) <= 1:
+            return None
+        spare = min(held, key=lambda i: len(remaining.get(i.get("category"), [])))
+        target = max(living, key=lambda x: self.relationships.get(str(x["id"]), 50))
+        self._log({"event": "trade_proposed", "cycle": self.cycle,
+                   "target_id": target["id"], "offered": spare["id"], "requested": want})
+        return {"target_id": target["id"], "offer_ids": [spare["id"]],
+                "requested_category": want}
+
+    def respond_to_trade(self, trade):
+        """accept / refuse / counter. A broken settled trade costs -20 relationship,
+        so only accept when something ownable actually matches the request."""
+        want = trade.get("requested_category")
+        mine = [i for i in self.known_info
+                if i.get("kind") in ("definite", "indirect")
+                and i.get("category", "indirect") == want]
+        if not mine:
+            return {"decision": "refuse"}
+        decision = {"decision": "accept", "offer_ids": [mine[0]["id"]]}
+        if self.belief is not None:
+            remaining = self.belief.remaining()
+            incoming = (trade.get("offer_categories") or {}).get(trade.get("proposer"))
+            # Counter if they want my scarcest category and offer nothing scarcer.
+            if incoming and len(remaining.get(want, [])) < len(remaining.get(incoming, [])):
+                decision = {"decision": "counter", "offer_ids": [mine[0]["id"]],
+                            "offer_category": want}
+        self._log({"event": "trade_response", "cycle": self.cycle,
+                   "trade_id": trade.get("trade_id"), "decision": decision["decision"]})
+        return decision
+
+    # ---------- helpers ----------
+
+    @staticmethod
+    def _in_range(value, size):
+        return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < size
+
+    @staticmethod
+    def _item_id(item):
+        return item.get("id") if isinstance(item, dict) else item
+
+    @staticmethod
+    def _readable(item):
+        if not isinstance(item, dict):
+            return {"id": item}
+        keep = ("id", "kind", "category", "candidate", "text", "excludes",
+                "character", "weapon", "room", "other")
+        return {k: item[k] for k in keep if k in item}
+
+    @staticmethod
+    def _parse(text):
+        if not isinstance(text, str):
+            return None
+        body = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+        start, end = body.find("{"), body.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(body[start:end + 1])
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     def _log(self, record):
         record.update({"agent_id": self.agent_id,
